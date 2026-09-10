@@ -42,7 +42,7 @@ jobs:
           ERRORS=""
 
           echo "===== Структура папок ====="
-          for p in app app/main.py client requirements.txt training training/requirements.txt; do
+          for p in app app/main.py requirements.txt training training/requirements.txt; do
             if [ -e "$p" ]; then
               echo "OK   $p"
             else
