@@ -1,0 +1,89 @@
+name: Check APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  check-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Начать работу
+        uses: actions/checkout@v4
+
+      - name: 2. Найти зип и распаковать
+        run: |
+          ZIP=$(find . -maxdepth 2 -iname "*.zip" | head -n 1)
+          if [ -n "$ZIP" ]; then
+            echo "Нашёл зип: $ZIP"
+            mkdir -p /tmp/unpacked
+            unzip -o "$ZIP" -d /tmp/unpacked
+          else
+            echo "Зип не найден, ищу apk прямо в репозитории."
+            mkdir -p /tmp/unpacked
+            cp -r . /tmp/unpacked/ 2>/dev/null || true
+          fi
+
+      - name: 3. Найти apk-файл внутри и открыть его
+        id: findapk
+        run: |
+          APK=$(find /tmp/unpacked . -iname "*.apk" 2>/dev/null | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::apk-файл нигде не найден (ни в зипе, ни в репозитории)."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Нашёл apk: $APK"
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/apk_contents
+          unzip -o "$APK" -d /tmp/apk_contents > /dev/null
+          echo "apk открыт (это тоже zip внутри), содержимое распаковано."
+
+      - name: Setup Android SDK (нужен aapt для чтения manifest/подписи)
+        if: steps.findapk.outputs.found == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: 4-5. Проверить apk целиком и собрать все ошибки за один присест
+        if: steps.findapk.outputs.found == 'true'
+        run: |
+          APK="${{ steps.findapk.outputs.apk_path }}"
+          AAPT=$(find "$ANDROID_HOME" -name "aapt" -type f 2>/dev/null | head -n 1)
+          ERRORS=""
+
+          echo "===== Размер файла ====="
+          ls -lh "$APK" || ERRORS="$ERRORS\n- не удалось прочитать сам файл"
+
+          echo "===== Структура (первые файлы) ====="
+          unzip -l "$APK" | head -30
+
+          if [ -z "$AAPT" ]; then
+            ERRORS="$ERRORS\n- aapt не нашёлся, инфо о manifest/подписи пропущено"
+          else
+            echo "===== Badging (manifest, package, permissions, min/target SDK) ====="
+            "$AAPT" dump badging "$APK" || ERRORS="$ERRORS\n- aapt dump badging упал с ошибкой (манифест повреждён/некорректен)"
+
+            echo "===== Подпись ====="
+            "$AAPT" dump badging "$APK" | grep -q "application-label" \
+              || ERRORS="$ERRORS\n- не найден application-label в манифесте"
+          fi
+
+          if [ ! -f /tmp/apk_contents/AndroidManifest.xml ]; then
+            ERRORS="$ERRORS\n- AndroidManifest.xml отсутствует внутри apk"
+          fi
+          if [ ! -d /tmp/apk_contents/res/mipmap-xxxhdpi ] && [ ! -d /tmp/apk_contents/res/mipmap-xxxhdpi-v4 ]; then
+            ERRORS="$ERRORS\n- нет иконки высокого разрешения (mipmap-xxxhdpi)"
+          fi
+          if [ ! -f /tmp/apk_contents/classes.dex ]; then
+            ERRORS="$ERRORS\n- classes.dex отсутствует (apk без кода?)"
+          fi
+
+          echo ""
+          echo "===== ИТОГ ====="
+          if [ -z "$ERRORS" ]; then
+            echo "Ошибок не найдено, apk выглядит целостным."
+          else
+            echo -e "Найденные проблемы:$ERRORS"
+            exit 1
+          fi
