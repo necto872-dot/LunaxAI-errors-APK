@@ -1,4 +1,4 @@
-name: Check APK
+name: Check server zip
 
 on:
   workflow_dispatch:
@@ -6,83 +6,108 @@ on:
     branches: [main, master]
 
 jobs:
-  check-apk:
+  check-server:
     runs-on: ubuntu-latest
     steps:
       - name: 1. Начать работу
         uses: actions/checkout@v4
 
       - name: 2. Найти зип и распаковать
+        id: find
         run: |
           ZIP=$(find . -maxdepth 2 -iname "*.zip" | head -n 1)
+          mkdir -p /tmp/unpacked
           if [ -n "$ZIP" ]; then
             echo "Нашёл зип: $ZIP"
-            mkdir -p /tmp/unpacked
             unzip -o "$ZIP" -d /tmp/unpacked
           else
-            echo "Зип не найден, ищу apk прямо в репозитории."
-            mkdir -p /tmp/unpacked
-            cp -r . /tmp/unpacked/ 2>/dev/null || true
+            echo "Зип не найден — проверяю сам репозиторий как есть."
+            cp -r . /tmp/unpacked/
           fi
-
-      - name: 3. Найти apk-файл внутри и открыть его
-        id: findapk
-        run: |
-          APK=$(find /tmp/unpacked . -iname "*.apk" 2>/dev/null | head -n 1)
-          if [ -z "$APK" ]; then
-            echo "::error::apk-файл нигде не найден (ни в зипе, ни в репозитории)."
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          SRC=/tmp/unpacked
+          if [ "$(find /tmp/unpacked -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ] && \
+             [ "$(find /tmp/unpacked -mindepth 1 -maxdepth 1 -type f | wc -l)" = "0" ]; then
+            SRC=$(find /tmp/unpacked -mindepth 1 -maxdepth 1 -type d)
           fi
-          echo "Нашёл apk: $APK"
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
-          echo "found=true" >> "$GITHUB_OUTPUT"
-          mkdir -p /tmp/apk_contents
-          unzip -o "$APK" -d /tmp/apk_contents > /dev/null
-          echo "apk открыт (это тоже zip внутри), содержимое распаковано."
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Android SDK (нужен aapt для чтения manifest/подписи)
-        if: steps.findapk.outputs.found == 'true'
-        uses: android-actions/setup-android@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: 4-5. Проверить apk целиком и собрать все ошибки за один присест
-        if: steps.findapk.outputs.found == 'true'
+      - name: 3-5. Проверить сервер целиком, собрать все ошибки за один присест
         run: |
-          APK="${{ steps.findapk.outputs.apk_path }}"
-          AAPT=$(find "$ANDROID_HOME" -name "aapt" -type f 2>/dev/null | head -n 1)
+          SRC="${{ steps.find.outputs.src }}"
+          cd "$SRC"
           ERRORS=""
 
-          echo "===== Размер файла ====="
-          ls -lh "$APK" || ERRORS="$ERRORS\n- не удалось прочитать сам файл"
+          echo "===== Структура папок ====="
+          for p in app app/main.py client requirements.txt training training/requirements.txt; do
+            if [ -e "$p" ]; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+              ERRORS="$ERRORS\n- отсутствует $p (структура плоская/сломана)"
+            fi
+          done
 
-          echo "===== Структура (первые файлы) ====="
-          unzip -l "$APK" | head -30
-
-          if [ -z "$AAPT" ]; then
-            ERRORS="$ERRORS\n- aapt не нашёлся, инфо о manifest/подписи пропущено"
+          echo ""
+          echo "===== requirements.txt: не должно быть ML-пакетов из training/ ====="
+          if [ -f requirements.txt ] && grep -Eiq '^(torch|transformers|peft|trl|bitsandbytes|accelerate|datasets|sentencepiece)([=<>~!]|$)' requirements.txt; then
+            echo "Найдены лишние пакеты:"
+            grep -Eni '^(torch|transformers|peft|trl|bitsandbytes|accelerate|datasets|sentencepiece)([=<>~!]|$)' requirements.txt
+            ERRORS="$ERRORS\n- requirements.txt содержит training-зависимости (torch/transformers/и т.п.)"
           else
-            echo "===== Badging (manifest, package, permissions, min/target SDK) ====="
-            "$AAPT" dump badging "$APK" || ERRORS="$ERRORS\n- aapt dump badging упал с ошибкой (манифест повреждён/некорректен)"
-
-            echo "===== Подпись ====="
-            "$AAPT" dump badging "$APK" | grep -q "application-label" \
-              || ERRORS="$ERRORS\n- не найден application-label в манифесте"
+            echo "Чисто."
           fi
 
-          if [ ! -f /tmp/apk_contents/AndroidManifest.xml ]; then
-            ERRORS="$ERRORS\n- AndroidManifest.xml отсутствует внутри apk"
+          echo ""
+          echo "===== uvicorn объявлен в requirements.txt ====="
+          if [ -f requirements.txt ] && grep -qi "^uvicorn" requirements.txt; then
+            echo "OK"
+          else
+            echo "НЕТ"
+            ERRORS="$ERRORS\n- uvicorn отсутствует в requirements.txt"
           fi
-          if [ ! -d /tmp/apk_contents/res/mipmap-xxxhdpi ] && [ ! -d /tmp/apk_contents/res/mipmap-xxxhdpi-v4 ]; then
-            ERRORS="$ERRORS\n- нет иконки высокого разрешения (mipmap-xxxhdpi)"
-          fi
-          if [ ! -f /tmp/apk_contents/classes.dex ]; then
-            ERRORS="$ERRORS\n- classes.dex отсутствует (apk без кода?)"
+
+          echo ""
+          echo "===== Python-синтаксис всех .py файлов ====="
+          SYNTAX_FAIL=0
+          while IFS= read -r f; do
+            if ! python3 -m py_compile "$f" 2>/tmp/pyerr; then
+              echo "СИНТАКСИС УПАЛ: $f"
+              cat /tmp/pyerr
+              SYNTAX_FAIL=1
+              ERRORS="$ERRORS\n- синтаксическая ошибка в $f"
+            fi
+          done < <(find app training tests -name "*.py" 2>/dev/null)
+          [ "$SYNTAX_FAIL" = "0" ] && echo "Ошибок синтаксиса нет."
+
+          echo ""
+          echo "===== Установка зависимостей и импорт app.main ====="
+          if [ -f requirements.txt ]; then
+            pip install -q -r requirements.txt 2>/tmp/pip_err || {
+              echo "pip install упал:"
+              cat /tmp/pip_err
+              ERRORS="$ERRORS\n- pip install -r requirements.txt завершился с ошибкой"
+            }
+            python3 -c "
+          import importlib, sys
+          try:
+              m = importlib.import_module('app.main')
+              assert hasattr(m, 'app'), 'app.main не содержит объект app'
+              print('app.main импортируется успешно, объект app найден.')
+          except Exception as e:
+              print('ИМПОРТ УПАЛ:', e)
+              sys.exit(1)
+          " || ERRORS="$ERRORS\n- app.main не импортируется (см. лог выше)"
+            command -v uvicorn >/dev/null || ERRORS="$ERRORS\n- uvicorn не оказался в PATH после установки"
           fi
 
           echo ""
           echo "===== ИТОГ ====="
           if [ -z "$ERRORS" ]; then
-            echo "Ошибок не найдено, apk выглядит целостным."
+            echo "Ошибок не найдено, сервер выглядит рабочим."
           else
             echo -e "Найденные проблемы:$ERRORS"
             exit 1
